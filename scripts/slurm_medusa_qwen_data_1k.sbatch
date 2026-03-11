@@ -19,7 +19,7 @@ BASE_MODEL="${BASE_MODEL:-/data1/public/hf/Qwen/Qwen2.5-3B-Instruct}"
 RAW_JSON="${RAW_JSON:-ShareGPT_Vicuna_unfiltered/ShareGPT_V4.3_unfiltered_cleaned_split.json}"
 SUBSET_JSON="${SUBSET_JSON:-data/sharegpt_1k_seed42.json}"
 OUT_JSON="${OUT_JSON:-data/qwen2p5_3b_medusa1_1k.json}"
-VLLM_PORT="${VLLM_PORT:-8000}"
+VLLM_PORT="${VLLM_PORT:-12380}"
 CONCURRENCY="${CONCURRENCY:-32}"
 
 export HF_HUB_OFFLINE=1
