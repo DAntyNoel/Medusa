@@ -25,6 +25,10 @@ CONCURRENCY="${CONCURRENCY:-32}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
+# Avoid inherited proxy settings interfering with localhost readiness checks
+# or httpx import-time initialization in create_data.py.
+unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
+
 cd "${REPO_DIR}"
 mkdir -p logs data
 
@@ -67,19 +71,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PROBE_URL="http://127.0.0.1:${VLLM_PORT}/v1/models"
+
+probe_vllm() {
+  curl --noproxy '*' -sS -f "${PROBE_URL}" >/dev/null
+}
+
 for i in $(seq 1 120); do
-  if curl -sf "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null; then
+  if probe_vllm; then
     echo "vLLM is ready"
     break
   fi
   sleep 5
 done
 
-curl -sf "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null
+if ! probe_vllm; then
+  echo "vLLM readiness probe failed: ${PROBE_URL}" >&2
+  echo "Current proxy-related environment:" >&2
+  env | grep -i proxy >&2 || true
+  echo "Verbose curl diagnostics:" >&2
+  curl --noproxy '*' -v "${PROBE_URL}" >/dev/null 2>&1 || true
+  exit 1
+fi
 
 echo "[3/4] Generating Qwen-style training data ..."
-# create_data.py uses httpx env proxies at import time; clear all proxy vars first.
-unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
 
 conda run -n medusa --no-capture-output python create_data.py \
   --input-filename "${SUBSET_JSON}" \
