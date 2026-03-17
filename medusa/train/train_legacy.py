@@ -33,7 +33,6 @@ from safetensors.torch import save_file
 
 from fastchat.conversation import SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
-from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 import os
 from medusa.model.medusa_model_legacy import MedusaModel, MedusaConfig
@@ -66,8 +65,7 @@ class CustomizedTrainer(Trainer):
         )
         labels = inputs["labels"]
         # Shift so that tokens < n predict n
-        loss = 0
-        loss_fct = CrossEntropyLoss()
+        loss = logits.new_zeros(())
         log = {}
         for i in range(medusa):
             medusa_logits = logits[i, :, : -(2 + i)].contiguous()
@@ -75,17 +73,30 @@ class CustomizedTrainer(Trainer):
             medusa_logits = medusa_logits.view(-1, logits.shape[-1])
             medusa_labels = medusa_labels.view(-1)
             medusa_labels = medusa_labels.to(medusa_logits.device)
-            loss_i = loss_fct(medusa_logits, medusa_labels)
+
+            valid_mask = medusa_labels.ne(IGNORE_TOKEN_ID)
+            if valid_mask.any():
+                loss_i = F.cross_entropy(
+                    medusa_logits,
+                    medusa_labels,
+                    ignore_index=IGNORE_TOKEN_ID,
+                )
+            else:
+                # Keep the step numerically stable when a sample has no assistant tokens.
+                loss_i = medusa_logits.new_zeros(())
+
             loss += loss_i
-            not_ignore = medusa_labels.ne(IGNORE_TOKEN_ID)
-            medusa_labels = medusa_labels[not_ignore]
+            medusa_labels = medusa_labels[valid_mask]
 
             # Add top-k accuracy
             for k in range(1, 2):
-                _, topk = medusa_logits.topk(k, dim=-1)
-                topk = topk[not_ignore]
-                correct = topk.eq(medusa_labels.unsqueeze(-1)).any(-1)
-                log[f"medusa{i}_top{k}"] = correct.float().mean().item()
+                if valid_mask.any():
+                    _, topk = medusa_logits.topk(k, dim=-1)
+                    topk = topk[valid_mask]
+                    correct = topk.eq(medusa_labels.unsqueeze(-1)).any(-1)
+                    log[f"medusa{i}_top{k}"] = correct.float().mean().item()
+                else:
+                    log[f"medusa{i}_top{k}"] = 0.0
 
             log[f"medusa{i}_loss"] = loss_i.item()
         self.log(log)
@@ -144,6 +155,16 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def has_nonempty_assistant_turn(sample) -> bool:
+    return isinstance(sample, list) and any(
+        isinstance(turn, dict)
+        and turn.get("role") == "assistant"
+        and isinstance(turn.get("content"), str)
+        and turn.get("content").strip()
+        for turn in sample
+    )
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -207,7 +228,8 @@ def preprocess(
                 stop = start + len(content)
                 indices= []
                 for tok_index, (tok_start, tok_stop) in enumerate(encoding.offset_mapping[conv_index]):
-                    if tok_stop >= start or tok_start < tok_stop:
+                    # Mark tokens that overlap assistant text span [start, stop).
+                    if tok_start < stop and tok_stop > start:
                         indices.append(tok_index)
                 target[indices] = encoding.input_ids[conv_index][indices]
 
@@ -215,7 +237,7 @@ def preprocess(
     return dict(
         input_ids=input_ids,
         labels=targets,
-        attention_mask=input_ids.ne(tokenizer.pad_token_id),
+        attention_mask=encoding.attention_mask,
     )
 
 
@@ -303,11 +325,24 @@ def make_supervised_data_module(
     )
     rank0_print("Loading data...")
 
-    train_json = json.load(open(data_args.data_path, "r"))
+    with open(data_args.data_path, "r") as f:
+        train_json = json.load(f)
+    train_json = [sample for sample in train_json if has_nonempty_assistant_turn(sample)]
+    rank0_print(f"Loaded {len(train_json)} train samples with assistant turns.")
+    if not train_json:
+        raise ValueError(
+            f"No valid train samples with non-empty assistant turns found in {data_args.data_path}"
+        )
     train_dataset = dataset_cls(train_json, tokenizer=tokenizer)
 
     if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
+        with open(data_args.eval_data_path, "r") as f:
+            eval_json = json.load(f)
+        eval_json = [sample for sample in eval_json if has_nonempty_assistant_turn(sample)]
+        if not eval_json:
+            raise ValueError(
+                f"No valid eval samples with non-empty assistant turns found in {data_args.eval_data_path}"
+            )
         eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer)
     else:
         eval_dataset = None

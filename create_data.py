@@ -1,6 +1,5 @@
 import typer
 import json
-from transformers import Conversation
 from typing_extensions import Annotated
 import httpx
 import tqdm
@@ -8,19 +7,34 @@ import asyncio
 
 app = typer.Typer()
 
+ALLOWED_ROLES = {"user", "assistant", "system"}
 
-client = httpx.AsyncClient(timeout=None)
 
-async def run(conv: Conversation, url: str):
-    payload = {"model":"tgi", "messages": conv.messages}
+def sanitize_message(message):
+    if not isinstance(message, dict):
+        raise ValueError(f"Message must be a dict, got {type(message).__name__}")
+
+    sanitized = {
+        "role": message.get("role"),
+        "content": message.get("content"),
+    }
+    if sanitized["role"] not in ALLOWED_ROLES:
+        raise ValueError(f"Unsupported message role: {sanitized['role']!r}")
+    if not isinstance(sanitized["content"], str):
+        raise ValueError("Message content must be a string")
+    return sanitized
+
+
+async def run(messages, url: str, client: httpx.AsyncClient):
+    payload = {"model": "tgi", "messages": messages}
     response = await client.post(url, json=payload)
+    response.raise_for_status()
     content = response.json()
-    message = content["choices"][0]["message"]
-    message.pop("name", None)
-    conv.add_message(message)
-
-
-
+    try:
+        message = content["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Malformed chat completion response") from exc
+    return sanitize_message(message)
 
 def fix_source(source):
     if source and source[0]["from"] == "gpt":
@@ -34,18 +48,30 @@ def fix_source(source):
     return new_source
 
 
-async def recreate_conversation(conversation, sem, url):
+async def recreate_conversation(index, conversation, sem, url, client):
     async with sem:
-        conv = Conversation()
+        messages = []
         try:
             for message in conversation[::2]:
-                assert message["role"] == "user"
-                conv.add_message(message)
-                await run(conv, url)
-        except Exception as e:
-            print(e)
-            pass
-        return conv.messages
+                user_message = sanitize_message(message)
+                if user_message["role"] != "user":
+                    raise ValueError("Conversation must alternate from a user turn")
+                messages.append(user_message)
+                assistant_message = await run(messages, url, client)
+                if assistant_message["role"] != "assistant":
+                    raise ValueError("Completion response must be an assistant turn")
+                if not assistant_message["content"].strip():
+                    raise ValueError("Completion response must contain non-empty content")
+                messages.append(assistant_message)
+        except Exception as exc:
+            raise RuntimeError(f"sample {index}: {exc}") from exc
+
+        if not any(
+            message["role"] == "assistant" and message["content"].strip()
+            for message in messages
+        ):
+            raise RuntimeError(f"sample {index}: missing non-empty assistant turn")
+        return index, messages
 
 @app.command()
 def main(
@@ -56,20 +82,40 @@ def main(
     concurrency: Annotated[int, typer.Option("--concurrency")] = 64
 ):
     sem = asyncio.Semaphore(concurrency)
+
     async def _main():
         with open(input_filename, "r") as f:
             input_data = json.loads(f.read())
         conversations = [fix_source(source["conversations"]) for source in input_data]
 
-        futures = []
-        for conversation in conversations:
-            future = recreate_conversation(conversation, sem, url)
-            futures.append(future)
+        async with httpx.AsyncClient(timeout=None) as client:
+            futures = []
+            for index, conversation in enumerate(conversations):
+                future = recreate_conversation(index, conversation, sem, url, client)
+                futures.append(future)
 
-        recreated_conversations = await tqdm.asyncio.tqdm.gather(*futures)
+            results = await tqdm.asyncio.tqdm.gather(*futures, return_exceptions=True)
+
+        recreated_conversations = [None] * len(conversations)
+        failures = []
+        for result in results:
+            if isinstance(result, Exception):
+                failures.append(str(result))
+                continue
+            index, messages = result
+            recreated_conversations[index] = messages
+
+        if failures:
+            failure_details = "\n".join(failures[:10])
+            raise RuntimeError(
+                f"Failed to recreate {len(failures)} conversations out of {len(conversations)}.\n"
+                f"first_failures:\n{failure_details}"
+            )
 
         with open(output_filename, "w") as f:
-            json.dump(recreated_conversations, f, indent=4)
+            json.dump(recreated_conversations, f, indent=4, ensure_ascii=False)
+        print(f"generated_samples {len(recreated_conversations)}")
+
     asyncio.run(_main())
 
 

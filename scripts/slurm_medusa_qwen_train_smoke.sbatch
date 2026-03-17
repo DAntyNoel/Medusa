@@ -37,6 +37,12 @@ if [[ ! -f "${DATA_JSON}" ]]; then
   exit 1
 fi
 
+echo "Validating training data before launch ..."
+if ! python extension/medusa_qwen_smoke_data_ops.py validate --input "${DATA_JSON}"; then
+  echo "Training data is invalid. Re-run bash scripts/submit_medusa_qwen_smoke.sh --force-regenerate" >&2
+  exit 1
+fi
+
 echo "Starting Medusa-1 smoke training ..."
 torchrun --nproc_per_node=4 medusa/train/train_legacy.py \
   --model_name_or_path "${BASE_MODEL}" \

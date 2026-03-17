@@ -21,7 +21,132 @@ from fastchat.serve.cli import SimpleChatIO, RichChatIO, ProgrammaticChatIO
 from fastchat.model.model_adapter import get_conversation_template
 from fastchat.conversation import get_conv_template
 import json
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from medusa.model.medusa_model import MedusaModel
+
+
+def get_model_device(model):
+    for parameter in model.parameters():
+        if parameter.device.type != "meta":
+            return parameter.device
+    return torch.device("cpu")
+
+
+def resolve_base_model_path(model_path, base_model_override=None):
+    if base_model_override:
+        return base_model_override
+
+    try:
+        config = AutoConfig.from_pretrained(model_path)
+    except Exception:
+        return model_path
+    return getattr(config, "base_model_name_or_path", model_path)
+
+
+def resolve_tokenizer_source(model_path, base_model_path):
+    tokenizer_files = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
+    if os.path.isdir(model_path) and any(
+        os.path.exists(os.path.join(model_path, filename)) for filename in tokenizer_files
+    ):
+        return model_path
+    return base_model_path
+
+
+def build_input_ids(tokenizer, prompt):
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            encoded = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if isinstance(encoded, torch.Tensor):
+                return encoded
+        except Exception:
+            pass
+    return tokenizer(prompt, return_tensors="pt").input_ids
+
+
+def load_runtime(args):
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    medusa_error = None
+
+    try:
+        model = MedusaModel.from_pretrained(
+            args.model,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            device_map="auto",
+            load_in_8bit=args.load_in_8bit,
+            load_in_4bit=args.load_in_4bit,
+        )
+        tokenizer = model.get_tokenizer()
+        return model, tokenizer, "medusa", medusa_error
+    except Exception as exc:
+        medusa_error = exc
+
+    base_model_path = resolve_base_model_path(args.model, args.base_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolve_tokenizer_source(args.model, base_model_path),
+        use_fast=True,
+    )
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        load_in_8bit=args.load_in_8bit,
+        load_in_4bit=args.load_in_4bit,
+    )
+    return model, tokenizer, "base", medusa_error
+
+
+def run_direct_inference(model, tokenizer, backend, prompt, args):
+    input_ids = build_input_ids(tokenizer, prompt)
+    attention_mask = torch.ones_like(input_ids)
+    device = get_model_device(model)
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+
+    if backend == "medusa":
+        text = ""
+        for output in model.medusa_generate(
+            input_ids,
+            attention_mask=attention_mask,
+            temperature=args.temperature,
+            max_steps=args.max_steps,
+        ):
+            text = output["text"]
+        return text.strip()
+
+    generate_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "max_new_tokens": args.max_steps,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    if tokenizer.eos_token_id is not None:
+        generate_kwargs["eos_token_id"] = tokenizer.eos_token_id
+    if args.temperature > 0:
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = args.temperature
+    else:
+        generate_kwargs["do_sample"] = False
+
+    output_ids = model.generate(**generate_kwargs)
+    return tokenizer.decode(
+        output_ids[0, input_ids.shape[1] :],
+        skip_special_tokens=True,
+        spaces_between_special_tokens=False,
+        clean_up_tokenization_spaces=True,
+    ).strip()
 
 
 def main(args):
@@ -34,19 +159,35 @@ def main(args):
     else:
         raise ValueError(f"Invalid style for console: {args.style}")
     try:
-        model = MedusaModel.from_pretrained(
-            args.model,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            load_in_8bit=args.load_in_8bit,
-            load_in_4bit=args.load_in_4bit,
-        )
-        tokenizer = model.get_tokenizer()
+        model, tokenizer, backend, medusa_error = load_runtime(args)
+        if medusa_error is not None:
+            print(
+                "Warning: Medusa accelerated backend is unavailable for this checkpoint; "
+                "falling back to base model generation for direct inference.",
+                file=sys.stderr,
+            )
+            print(f"Backend load error: {medusa_error}", file=sys.stderr)
+
+        if args.prompt is not None:
+            print(run_direct_inference(model, tokenizer, backend, args.prompt, args))
+            return
+
+        if backend != "medusa":
+            raise ValueError(
+                "Interactive mode requires a Medusa-backed checkpoint. "
+                "Use --prompt for direct one-shot inference on this model."
+            )
+
         conv = None
 
         def new_chat():
-            return get_conversation_template(args.model)
+            if args.conv_template:
+                conv = get_conv_template(args.conv_template)
+            else:
+                conv = get_conversation_template(args.base_model or args.model)
+            if args.conv_system_msg:
+                conv.set_system_message(args.conv_system_msg)
+            return conv
 
         def reload_conv(conv):
             """
@@ -186,6 +327,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True, help="Model name or path.")
     parser.add_argument(
+        "--base-model",
+        type=str,
+        default=None,
+        help="Optional base model path override for local checkpoints.",
+    )
+    parser.add_argument(
         "--load-in-8bit", action="store_true", help="Use 8-bit quantization"
     )
     parser.add_argument(
@@ -199,6 +346,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-steps", type=int, default=512)
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Run a single direct inference prompt and exit.",
+    )
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument(
         "--style",

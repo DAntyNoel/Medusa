@@ -30,7 +30,7 @@ export TRANSFORMERS_OFFLINE=1
 unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy
 
 cd "${REPO_DIR}"
-mkdir -p logs data
+mkdir -p logs "$(dirname "${SUBSET_JSON}")" "$(dirname "${OUT_JSON}")"
 
 if [[ ! -f "${RAW_JSON}" ]]; then
   echo "Input dataset not found: ${RAW_JSON}" >&2
@@ -41,6 +41,10 @@ if [[ ! -d "${BASE_MODEL}" ]]; then
   echo "Base model path not found: ${BASE_MODEL}" >&2
   exit 1
 fi
+
+OUT_JSON_DIR="$(dirname "${OUT_JSON}")"
+OUT_JSON_BASE="$(basename "${OUT_JSON}")"
+TMP_OUT_JSON="$(mktemp "${OUT_JSON_DIR}/${OUT_JSON_BASE}.tmp.XXXXXX")"
 
 echo "[1/4] Sampling 1000 examples from ShareGPT ..."
 conda run -n medusa --no-capture-output python extension/medusa_qwen_smoke_data_ops.py \
@@ -68,6 +72,7 @@ cleanup() {
     kill "${VLLM_PID}" >/dev/null 2>&1 || true
     wait "${VLLM_PID}" >/dev/null 2>&1 || true
   fi
+  rm -f "${TMP_OUT_JSON}"
 }
 trap cleanup EXIT
 
@@ -95,16 +100,23 @@ if ! probe_vllm; then
 fi
 
 echo "[3/4] Generating Qwen-style training data ..."
+if [[ -f "${OUT_JSON}" ]]; then
+  echo "Will overwrite existing dataset: ${OUT_JSON}"
+fi
+echo "Temporary output file: ${TMP_OUT_JSON}"
 
 conda run -n medusa --no-capture-output python create_data.py \
   --input-filename "${SUBSET_JSON}" \
-  --output-filename "${OUT_JSON}" \
+  --output-filename "${TMP_OUT_JSON}" \
   --url "http://127.0.0.1:${VLLM_PORT}/v1/chat/completions" \
   --concurrency "${CONCURRENCY}"
 
 echo "[4/4] Validating generated JSON ..."
 conda run -n medusa --no-capture-output python extension/medusa_qwen_smoke_data_ops.py \
   validate \
-  --input "${OUT_JSON}"
+  --input "${TMP_OUT_JSON}"
+
+mv -f "${TMP_OUT_JSON}" "${OUT_JSON}"
+echo "Published dataset: ${OUT_JSON}"
 
 echo "Done. Output: ${OUT_JSON}"

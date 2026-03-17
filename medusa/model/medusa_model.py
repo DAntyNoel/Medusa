@@ -15,6 +15,7 @@ from .medusa_choices import *
 from transformers import AutoTokenizer, AutoConfig
 import os
 from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 import warnings
 
 class MedusaConfig(PretrainedConfig):
@@ -148,12 +149,29 @@ class MedusaModelABC(nn.Module):
                 **kwargs,
                 config=base_model_config,
             )
-            medusa_head_path = os.path.join(pretrained_model_name_or_path, "medusa_lm_head.pt")
-            if os.path.exists(medusa_head_path):
-                filename = medusa_head_path
+            medusa_head_pt_path = os.path.join(
+                pretrained_model_name_or_path, "medusa_lm_head.pt"
+            )
+            medusa_head_st_path = os.path.join(
+                pretrained_model_name_or_path, "medusa_lm_head.safetensors"
+            )
+            if os.path.exists(medusa_head_pt_path):
+                filename = medusa_head_pt_path
+            elif os.path.exists(medusa_head_st_path):
+                filename = medusa_head_st_path
             else:
-                filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
-            medusa_head_state_dict = torch.load(filename, map_location=model.device)
+                try:
+                    filename = hf_hub_download(
+                        pretrained_model_name_or_path, "medusa_lm_head.pt"
+                    )
+                except Exception:
+                    filename = hf_hub_download(
+                        pretrained_model_name_or_path, "medusa_lm_head.safetensors"
+                    )
+            if filename.endswith(".safetensors"):
+                medusa_head_state_dict = load_file(filename, device=str(model.device))
+            else:
+                medusa_head_state_dict = torch.load(filename, map_location=model.device)
             model.medusa_head.load_state_dict(medusa_head_state_dict, strict=False)
             return model
         

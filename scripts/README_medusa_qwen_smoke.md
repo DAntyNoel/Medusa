@@ -40,6 +40,26 @@ Submit with an explicit partition:
 bash scripts/submit_medusa_qwen_smoke.sh A100
 ```
 
+Force data regeneration even if an existing dataset is present:
+
+```bash
+bash scripts/submit_medusa_qwen_smoke.sh A100 --force-regenerate
+```
+
+## Direct inference
+
+Run one-shot direct inference from a local smoke checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m medusa.inference.cli \
+  --model outputs/medusa1_qwen2p5_3b_smoke_medusa_mlp_Qwen2.5-3B-Instruct_medusa_3_lr_0.001_layers_1 \
+  --base-model /data1/public/hf/Qwen/Qwen2.5-3B-Instruct \
+  --prompt "用一句话介绍 Medusa" \
+  --max-steps 64
+```
+
+For local Qwen smoke checkpoints, the CLI currently falls back to base-model generation for one-shot direct inference when Medusa accelerated loading is unavailable.
+
 ## Optional overrides
 
 You can override variables at submit time:
